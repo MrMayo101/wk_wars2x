@@ -174,6 +174,9 @@ RADAR.vars =
 		-- The volume of the plate reader audio
 		["plateAudio"] = CONFIG.menuDefaults["plateAudio"],
 
+		-- The volume of the doppler audio 
+		["dopAudio"] = CONFIG.menuDefaults["dopAud"],
+
 		-- The speed unit used in conversions
 		["speedType"] = CONFIG.menuDefaults["speedType"],
 
@@ -195,6 +198,7 @@ RADAR.vars =
 		{ displayText = { "bEE", "P¦¦" }, optionsText = { "Off", "¦1¦", "¦2¦", "¦3¦", "¦4¦", "¦5¦" }, options = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 }, optionIndex = -1, settingText = "beep" },
 		{ displayText = { "VOI", "CE¦" }, optionsText = { "Off", "¦1¦", "¦2¦", "¦3¦", "¦4¦", "¦5¦" }, options = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 }, optionIndex = -1, settingText = "voice" },
 		{ displayText = { "PLt", "AUd" }, optionsText = { "Off", "¦1¦", "¦2¦", "¦3¦", "¦4¦", "¦5¦" }, options = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 }, optionIndex = -1, settingText = "plateAudio" },
+		{ displayText = { "DOP", "AUd" }, optionsText = { "Off", "¦1¦", "¦2¦", "¦3¦", "¦4¦", "¦5¦" }, options = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 }, optionIndex = -1, settingText = "dopAudio" },
 		{ displayText = { "Uni", "tS¦" }, optionsText = { "USA", "INT" }, options = { "mph", "kmh" }, optionIndex = -1, settingText = "speedType" }
 	},
 
@@ -334,12 +338,19 @@ function RADAR:SetPowerState( state, instantOverride )
 
 					-- Let the UI side know the system has loaded
 					SendNUIMessage( { _type = "poweredUp", fast = self:IsFastDisplayEnabled() } )
+
+					Citizen.Wait( 200 )
+					self:SetDopplerState( true )
 				end )
+			else
+				self:SetDopplerState( true )
 			end
 		else
 			-- If the system is being turned off, then we reset the antennas
 			self:ResetAntenna( "front" )
 			self:ResetAntenna( "rear" )
+
+			self:SetDopplerState( false )
 		end
 	end
 end
@@ -358,6 +369,11 @@ function RADAR:GetDisplayState()
 	return self.vars.displayed
 end
 
+-- Client export used to get whether the radar is displayed or hidden
+exports( "GetDisplayState", function()
+    return RADAR:GetDisplayState()
+end )
+
 -- Return the state of the fastDisplay setting, short hand direct way to check if the fast system is enabled
 function RADAR:IsFastDisplayEnabled()
 	return self:GetSettingValue( "fastDisplay" )
@@ -367,6 +383,11 @@ end
 function RADAR:IsEitherAntennaOn()
 	return self:IsAntennaTransmitting( "front" ) or self:IsAntennaTransmitting( "rear" )
 end
+
+-- Client export used to get whether either of the antennas are turned on
+exports( "IsEitherAntennaOn", function()
+    return RADAR:IsEitherAntennaOn()
+end )
 
 -- Sends an update to the NUI side with the current state of the antennas and if the fast system is enabled
 function RADAR:SendSettingUpdate()
@@ -384,13 +405,16 @@ function RADAR:SendSettingUpdate()
 
 	-- Send a message to the NUI side with the current state of the antennas
 	SendNUIMessage( { _type = "settingUpdate", antennaData = antennas } )
+
+	-- Send a message to the NUI side with the current setting for the doppler audio volume
+	SendNUIMessage( { _type = "dopplerVolume", vol = self:GetSettingValue( "dopAudio" ) } )
 end
 
 -- Returns if a main task can be performed
 -- A main task such as the ray trace thread should only run if the radar's power is on, the system is not in the
 -- process of powering up, and the operator menu is not open
 function RADAR:CanPerformMainTask()
-	return self:IsPowerOn() and not self:IsPoweringUp() and not self:IsMenuOpen()
+	return self:IsPowerOn() and not self:IsPoweringUp() and not self:IsMenuOpen() and not self:GetDisplayHidden()
 end
 
 -- Returns/sets what the dynamic thread wait time is
@@ -516,6 +540,14 @@ function RADAR:GetKeyLockState()
 	return self.vars.keyLock
 end
 
+function RADAR:SetDopplerState( state )
+	local dopVol = self:GetSettingValue( "dopAudio" )
+
+	if ( dopVol ~= 0.0 ) then
+		SendNUIMessage( { _type = "dopplerState", state = state } )
+	end
+end
+
 
 --[[----------------------------------------------------------------------------------
 	Radar menu functions
@@ -530,6 +562,9 @@ function RADAR:SetMenuState( state )
 		-- If we are opening the menu, make sure the first item is displayed
 		if ( state ) then
 			self.vars.currentOptionIndex = 1
+
+			-- Stop the doppler audio
+			self:SetDopplerState( false )
 		end
 	end
 end
@@ -541,6 +576,9 @@ function RADAR:CloseMenu( playAudio )
 
 	-- Send a setting update to the NUI side
 	RADAR:SendSettingUpdate()
+
+	-- Allow the doppler audio
+	self:SetDopplerState( true )
 
 	-- Play a menu done beep
 	if ( playAudio or playAudio == nil ) then
@@ -679,6 +717,9 @@ function RADAR:LoadOMData()
 	if ( rawData ~= nil ) then
 		local omData = json.decode( rawData )
 		self.vars.settings = omData
+
+		-- Send the doppler volume
+		SendNUIMessage( { _type = "dopplerVolume", vol = self:GetSettingValue( "dopAudio" ) } )
 
 		UTIL:Log( "Saved operator menu data loaded!" )
 	else
@@ -1710,7 +1751,7 @@ function RADAR:Main()
 				-- see if it is a particular type (e.g. if i % 2 == 0 then it's the 'fastest' vehicle)
 				for i = 1, 2 do
 					-- Create the table to store the speed and direction for this vehicle data
-					data.antennas[ant][i] = { speed = "¦¦¦", dir = 0 }
+					data.antennas[ant][i] = { speed = "¦¦¦", dir = 0, dopValue = nil }
 
 					-- If the current iteration is the number 2 ('fastest') and there's a speed locked, grab the locked speed
 					-- and direction
@@ -1728,6 +1769,10 @@ function RADAR:Main()
 							local vehSpeed = GetEntitySpeed( av[ant][i].veh )
 							local convertedSpeed = self:GetVehSpeedConverted( vehSpeed )
 							data.antennas[ant][i].speed = UTIL:FormatSpeed( convertedSpeed )
+
+							-- Set the doppler audio value to the exact vehicle entity speed, this way the doppler audio will be the same for
+							-- MPH and KMH
+							data.antennas[ant][i].dopValue = vehSpeed
 
 							-- Work out if the vehicle is closing or away
 							local ownH = UTIL:Round( GetEntityHeading( PLY.veh ), 0 )
@@ -1768,6 +1813,9 @@ function RADAR:Main()
 
 		-- Send the update to the NUI side
 		SendNUIMessage( { _type = "update", speed = data.patrolSpeed, antennas = data.antennas } )
+
+		-- Event for Sonoran CAD's radar script
+		TriggerEvent( "Sonoran::UpdateAnt", data.antennas )
 	end
 end
 
